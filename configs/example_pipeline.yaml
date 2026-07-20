@@ -1,0 +1,88 @@
+dataset_path: /data/ERA/D63_Nr7_8
+experiment: Versuch1
+stop_after: dataset_validation
+reference_signal: position
+session_gap_seconds: 3600.0
+movement_threshold: 1.0
+output_root: outputs
+
+# Final full-dataset run
+extract_all_cycles: true
+max_cycles_to_extract: 100
+cycle_batch_size: 500
+resume_extraction: true
+overwrite_existing: false
+
+# HTML is useful for development, but not necessary for all cycles
+generate_validation_html: false
+validation_cycle_count: 3
+require_consecutive_validation_cycles: true
+max_cycles_to_scan_for_validation: 10000
+
+generate_cycle_features: false
+parquet_compression: zstd
+quality_profiling_batch_size: 1000
+
+selected_extraction_signals:
+  - position
+  - velocity
+  - current
+  - pressure
+  - temperature
+  - vibration_x
+  - vibration_y
+  - vibration_z
+
+required_validation_signals:
+  - position
+  - velocity
+  - current
+  - pressure
+  - temperature
+
+minimum_samples_per_validation_cycle:
+  position: 20
+  velocity: 20
+  current: 20
+  pressure: 1
+  vibration_x: 20
+  vibration_y: 20
+  vibration_z: 20
+  temperature: 1
+
+cycle_quality_profiling:
+  enabled: true
+
+signal_roles:
+  cycle_reference:
+    - position
+
+  core_required:
+    - position
+    - velocity
+    - current
+    - pressure
+    - temperature
+
+  optional_duty_cycled:
+    - vibration_x
+    - vibration_y
+    - vibration_z
+
+validation_rule_generation:
+  enabled: true
+  reference_population: all_profiled_cycles
+  default_method: median_mad
+  mad_z_limit: 3.5
+  lower_quantile: 0.01
+  upper_quantile: 0.99
+  minimum_reference_count: 20
+  fallback_method: quantile
+  freeze_rules: true
+  mark_small_or_limited_population_as_provisional: true
+
+dataset_validation:
+  enabled: true
+  fail_on_missing_generated_rule: false
+  allow_provisional_rules: false
+  write_signal_level_results: true
