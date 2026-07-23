@@ -31,11 +31,22 @@ def _compute_sampling_intervals_ms(signal_df: pd.DataFrame) -> pd.Series:
 
 
 def main() -> None:
-    """Load, summarize, and plot the Versuch1 position signal."""
+    """Load, summarize, and plot the Versuch1 position and current signal."""
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
     uuid_info = build_uuid_signal_info(BASE_DIR)
+    current_signals = find_signals(
+    uuid_info,
+    path_contains="Versuch1",
+    unit_code="current",
+    )
+
+    if current_signals.empty:
+        raise ValueError("No UUID-based current signal found for Versuch1.")
+
+    current_signal_id_uuid = str(current_signals.iloc[0]["signal_id_uuid"])
+
     position_signals = find_signals(
         uuid_info,
         path_contains="Versuch1",
@@ -43,8 +54,18 @@ def main() -> None:
     )
     if position_signals.empty:
         raise ValueError("No UUID-based position signal found for Versuch1.")
+        current_df = load_uuid_signal(
+        BASE_DIR,
+        current_signal_id_uuid,
+        start_time=START_TIME,
+        end_time=END_TIME,
+        )
+
+        if current_df.empty:
+            raise ValueError("No current samples were loaded.")
 
     signal_id_uuid = str(position_signals.iloc[0]["signal_id_uuid"])
+
     signal_df = load_uuid_signal(
         BASE_DIR,
         signal_id_uuid,
@@ -61,10 +82,12 @@ def main() -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(signal_df["time"], signal_df["value"], linewidth=1.0)
-    ax.set_title("Position Signal – Versuch1")
+    ax.plot(signal_df["time"], signal_df["value"], linewidth=1.0, label="Position")
+    ax.plot(current_df["time"], current_df["value"], label="Current")
+
+    ax.set_title("Position and Current Signals – Versuch1")
     ax.set_xlabel("Time")
-    ax.set_ylabel("Position Value")
+    ax.set_ylabel("signal Value")
     ax.grid(True)
     fig.tight_layout()
     fig.savefig(OUTPUT_PATH, dpi=150)

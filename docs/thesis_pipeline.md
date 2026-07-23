@@ -7,10 +7,10 @@ Author:
 Fatemeh Heydari
 
 Version:
-1.0
+2.2
 
 Last Update:
-2026-07-10
+2026-07-23
 
 ---
 
@@ -347,17 +347,48 @@ Extract all available sensor signals belonging to one detected Position cycle.
 - ESP32 vibration (`vibration_x`, `vibration_y`, `vibration_z`)
 - Integer vibration
 
-### Method
+Method
 
-The Position cycle timestamps define the extraction interval.
+The cycle start and end timestamps generated during Position-based cycle detection define the extraction interval for each cycle.
 
-Every remaining sensor is loaded only inside this interval.
+To avoid repeatedly reading the same Parquet data, the pipeline uses a session-level signal cache.
 
-The **default extraction population is read directly from the Position-based
-cycle-detection output (`cycles.parquet`)**. In pilot mode
-(`extract_all_cycles: false`) the first `max_cycles_to_extract` candidate
-cycles are extracted, exactly as detected — no cycle is skipped or rejected
-because a signal is missing.
+For each recording session, the pipeline:
+
+loads every configured signal once for the complete session interval,
+stores the measurements temporarily in memory,
+extracts each cycle by slicing the cached signal data between the cycle start and end timestamps,
+releases the cached data after all cycles belonging to the session have been processed.
+
+The extracted cycle boundaries remain unchanged and are still taken directly from the Position-based cycle-detection output.
+
+The default extraction population is read from:
+
+cycles.parquet
+
+In pilot mode:
+
+extract_all_cycles: false
+
+the first max_cycles_to_extract detected cycles are processed.
+
+No cycle is skipped or rejected during extraction because an optional signal is unavailable.
+
+Batch Processing
+
+Cycles are processed in configurable batches.
+
+Batching is used to:
+
+write extracted measurements incrementally,
+limit the amount of temporary result data held in memory,
+record progress,
+support checkpointing and resumed runs.
+
+Batching and session caching have different roles:
+
+the session cache avoids repeated Parquet reads,
+batching controls output writing, progress tracking and restart behavior.
 
 ### Important Design Decision: Extraction Never Rejects on Missing Signals
 
@@ -369,17 +400,20 @@ quality problem.
 
 The pipeline therefore distinguishes explicitly between:
 
-- **extraction failure** — a real technical error prevented the cycle from
-  being processed (e.g. a corrupt partition, an unreadable file). Recorded
-  via an `extraction_error` flag and counted in
-  `multi_sensor_extraction.failed_cycles`.
-- **signal unavailable** — the signal has zero samples inside the cycle
-  window. Recorded via `missing_signal` / `signal_present=False`. This is
-  **not** an extraction failure.
-- **signal available but empty after filtering**, **signal available with
-  non-finite values**, and **successfully extracted signal** — all recorded
-  explicitly via `sample_count`, `finite_sample_count`,
-  `first_timestamp`/`last_timestamp` per cycle/signal.
+- extraction failure — a technical error prevented the cycle from being processed, such as an unreadable or corrupted data partition,
+- signal unavailable — the signal contains zero samples inside the cycle interval,
+- signal available but containing non-finite values,
+- successfully extracted signal.
+
+These states are recorded using information such as:
+
+extraction_error,
+missing_signal,
+signal_present,
+sample_count,
+finite_sample_count,
+first_timestamp,
+last_timestamp.
 
 An absent optional signal (most commonly vibration) never causes the whole
 cycle to be marked as a failed extraction.
@@ -390,26 +424,52 @@ The original timestamps and sampling frequencies are preserved.
 
 No interpolation or resampling is performed during preprocessing.
 
-### Standalone Utility: Vibration-Aware Cycle Selection
 
-`src/preprocessing/cycle_selection.py` implements an optional, standalone
-sampling utility (`complete_multisensor_stratified` mode) that scans
-`cycles.parquet` in bounded batches, checks the actual raw measurements
-inside each candidate cycle's own time window, detects vibration-recording
-bursts from real inter-sample gaps, and picks a deterministic subset of
-cycles that are guaranteed to contain complete multisensor (including
-vibration) coverage, spread across sessions, time strata, and vibration
-bursts.
+## Backward Compatibility
 
-This utility is **not** part of the default `PipelineStage` sequence and is
-not required by `multi_sensor_extraction`, `cycle_quality_profiling`,
-`validation_rule_generation`, or `dataset_validation`. It remains useful for
-targeted studies that specifically need a pilot subset with complete
-vibration coverage (e.g. vibration-focused analyses), but the default
-scientific workflow profiles and validates the naturally detected cycle
-population — including cycles without vibration — rather than pre-filtering
-for vibration completeness.
+The extraction function still supports the previous direct-loading method.
 
+When a session cache is provided, measurements are sliced from memory.
+
+When no cache is provided, the function falls back to loading the requested cycle interval directly from the Parquet dataset.
+
+## Standalone Utility: Vibration-Aware Cycle Selection
+
+src/preprocessing/cycle_selection.py provides the optional complete_multisensor_stratified selection mode.
+
+The utility scans candidate cycles in bounded batches, checks the raw measurements within their cycle intervals, detects vibration-recording bursts from timestamp gaps, and selects a deterministic subset with complete multi-sensor coverage.
+
+The selected cycles can be distributed across:
+
+recording sessions,
+time strata,
+vibration bursts.
+
+This utility is not part of the default pipeline sequence and is not required for:
+
+multi-sensor extraction,
+cycle-quality profiling,
+validation-rule generation,
+dataset validation.
+
+It remains useful for targeted analyses that require cycles with complete vibration coverage.
+
+The default scientific workflow continues to extract, profile and validate the naturally detected cycle population, including cycles without vibration.
+
+## Validation
+
+The updated extraction implementation was checked with the complete automated test suite.
+
+90 / 90 tests passed
+
+The optimization did not change:
+
+cycle detection,
+cycle boundaries,
+external APIs,
+output formats,
+checkpoint behavior,
+validation logic.
 ---
 
 # Stage 8
@@ -579,14 +639,70 @@ Written to `dataset_validation/`:
 
 Status
 
-Planned
+Partially Implemented
 
 ### Objective
 
 Transform the raw sensor measurements into numerical descriptors suitable for
 machine learning.
 
-### Currently Implemented
+### Stage 10.1 — Cycle Tensor Dataset Generation
+
+Implemented in `src/feature_engineering/cycle_tensor_generation.py` and
+integrated into the pipeline as the `feature_engineering` stage
+(runs immediately after `dataset_validation`).
+
+Follows the thesis' **padding** methodology, not interpolation: it turns
+every `valid_core_cycle` into a fixed-length, ML-ready sample of shape
+`target_length x number_of_signals`, then stacks samples into batches of
+shape `batch_size x target_length x number_of_signals`, while keeping every
+original measured value exactly as extracted:
+
+- reads only `cycle_id` from `valid_core_cycles.parquet` (never re-derives or
+  re-checks validity),
+- resolves each cycle's `start_time`/`end_time` from the cycle index,
+- defines one cycle's length as its number of raw `reference_signal`
+  samples (`position` by default),
+- derives a single `target_length` up front from the observed distribution
+  of cycle lengths across every valid core cycle (`target_length_strategy`:
+  `max`, or a configurable `target_length_percentile`, default `99`),
+- for every required signal (`position`, `velocity`, `current`, `pressure`,
+  `temperature` by default), keeps its own raw, native-rate values and
+  pads shorter sequences at the **end** with edge padding (repeats the last
+  real value; zero padding is never used) or truncates longer sequences at
+  the **end** — no signal is ever resampled onto another signal's timeline,
+  preserving signal order,
+- builds a padding mask per cycle (`1` = real sample, `0` = padding) derived
+  from the reference signal's original length vs. `target_length`,
+- logs every truncation and records the truncated sample count,
+- skips (and records) any cycle missing a required signal instead of
+  aborting the run.
+
+Configurable via the `cycle_tensor_generation` config block:
+`required_signals`, `reference_signal` (default `position`),
+`target_length_strategy` (`max`/`percentile`, default `percentile`),
+`target_length_percentile` (default `99`), `padding_method` (default
+`edge`), `truncate_long_cycles` (default `true`), `save_padding_mask`
+(default `true`), `output_format` (default `npy`), `cycles_per_file`
+(default `64`).
+
+Written to `feature_engineering/`:
+
+- one NumPy tensor file per batch, named e.g.
+  `D63_Nr7_Versuch1_cycles_000001_000064.npy`,
+- one matching NumPy padding-mask file per batch (when
+  `save_padding_mask` is enabled), e.g.
+  `D63_Nr7_Versuch1_cycles_000001_000064_mask.npy`,
+- `cycle_tensor_metadata.parquet` — one row per written cycle with
+  `cycle_id`, `session_id`, `cycle_start`, `cycle_end`,
+  `cycle_duration_seconds`, `original_cycle_length`, `target_length`,
+  `padded_samples`, `truncated_samples`, and its batch file,
+- `skipped_cycles.parquet` — cycles skipped due to a missing required
+  signal,
+- `cycle_tensor_generation_summary.json` — run-level counts,
+- `cycle_length_statistics.json` — minimum/maximum/mean/median/p95/p99
+  cycle length, the selected target length, and the number of padded vs.
+  truncated cycles.
 
 ### Current Progress
 
@@ -597,8 +713,7 @@ signals.
 These statistics support exploratory analysis and debugging but are not part
 of the formal Feature Engineering stage.
 
-The complete Feature Engineering stage, including frequency-domain,
-cycle-shape and cross-sensor features, remains future work.
+Frequency-domain, cycle-shape and cross-sensor features remain future work.
 
 
 
@@ -662,7 +777,7 @@ preprocessing pipeline before being evaluated by the trained model.
 | Cycle Quality Profiling | ✅ Completed |
 | Validation Rule Generation | ✅ Completed |
 | Dataset Validation | ✅ Completed |
-| Feature Engineering | ⏳ Planned (partial time-domain utility available) |
+| Feature Engineering | ⏳ Partially Implemented (cycle tensor dataset generation available) |
 | Machine Learning Dataset | ⏳ Planned |
 | Anomaly Detection | ⏳ Planned |
 

@@ -130,6 +130,7 @@ def _build_config(args: argparse.Namespace) -> PipelineConfig:
         signal_roles=yaml_config.get("signal_roles"),
         validation_rule_generation=yaml_config.get("validation_rule_generation"),
         dataset_validation=yaml_config.get("dataset_validation"),
+        cycle_tensor_generation=yaml_config.get("cycle_tensor_generation"),
     )
 
 

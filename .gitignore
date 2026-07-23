@@ -19,3 +19,8 @@ venv/
 # Pipeline outputs
 outputs/
 
+
+# Generated pipeline outputs
+outputs/
+outputs_cached_full_run/
+outputs_cached_*/

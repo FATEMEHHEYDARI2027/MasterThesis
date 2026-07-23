@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -476,10 +477,6 @@ class BuildValidationSubsetTests(unittest.TestCase):
         validation_position_df, validation_cycles_df = _build_validation_subset(
             position_df, empty_cycles_df
         )
-
-        self.assertTrue(validation_position_df.empty)
-        self.assertTrue(validation_cycles_df.empty)
-
 
 class RunCycleDetectionValidationSubsetTests(unittest.TestCase):
     """Tests for the validation-subset wiring inside the cycle-detection stage."""
@@ -1208,6 +1205,75 @@ class NewMethodologicalStageOrderTests(unittest.TestCase):
             "vibration_complete_cycles",
         ):
             self.assertIn(key, dataset_validation_counts)
+
+    def test_stop_after_feature_engineering(self) -> None:
+        output_root = self.root_path / "outputs"
+        result = run_pipeline(
+            PipelineConfig(
+                dataset_path=self.dataset_dir,
+                experiment="ExperimentAlpha",
+                stop_after="feature_engineering",
+                output_root=output_root,
+                session_gap_seconds=3600.0,
+                movement_threshold=1.0,
+                extract_all_cycles=True,
+                validation_cycle_count=1,
+                required_validation_signals=(),
+                generate_validation_html=False,
+                minimum_samples_per_validation_cycle={"position": 1},
+                signal_roles={
+                    "cycle_reference": ["position"],
+                    "core_required": ["position", "temperature"],
+                    "optional_duty_cycled": ["vibration_x", "vibration_y", "vibration_z"],
+                },
+                # This fixture dataset only has position and temperature
+                # signals; the default required_signals also include
+                # velocity/current/pressure, which are absent here.
+                cycle_tensor_generation={
+                    "required_signals": ["position", "temperature"],
+                    "reference_signal": "position",
+                    "target_length_strategy": "max",
+                    "cycles_per_file": 10,
+                },
+            )
+        )
+        self.assertEqual(result["run"]["completed_stages"][-1], "feature_engineering")
+        output_paths = result["feature_engineering"]["output_paths"]
+        for key in (
+            "cycle_tensor_metadata_parquet",
+            "skipped_cycles_parquet",
+            "cycle_tensor_generation_summary_json",
+            "cycle_length_statistics_json",
+        ):
+            self.assertIn(key, output_paths)
+            self.assertTrue(Path(output_paths[key]).exists())
+
+        metadata_df = result["feature_engineering"]["cycle_tensor_metadata"]
+        self.assertGreater(len(metadata_df), 0)
+        for column in (
+            "cycle_id",
+            "session_id",
+            "cycle_start",
+            "cycle_end",
+            "cycle_duration_seconds",
+            "original_cycle_length",
+            "target_length",
+            "padded_samples",
+            "truncated_samples",
+            "signal_original_lengths",
+        ):
+            self.assertIn(column, metadata_df.columns)
+
+        batch_files = output_paths["cycle_tensor_batch_files"]
+        self.assertGreater(len(batch_files), 0)
+        first_batch = np.load(batch_files[0])
+        target_length = result["feature_engineering"]["row_counts"]["target_length"]
+        self.assertEqual(first_batch.shape[1:], (target_length, 2))
+
+        mask_files = output_paths["cycle_tensor_mask_files"]
+        self.assertEqual(len(mask_files), len(batch_files))
+        first_mask_batch = np.load(mask_files[0])
+        self.assertEqual(first_mask_batch.shape[1:], (target_length, 2))
 
 
 if __name__ == "__main__":

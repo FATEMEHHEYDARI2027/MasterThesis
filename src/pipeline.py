@@ -15,6 +15,10 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
+from src.feature_engineering.cycle_tensor_generation import (
+    CycleTensorGenerationConfig,
+    generate_cycle_tensor_dataset,
+)
 from src.preprocessing.cycle_detection import detect_candidate_cycles
 from src.preprocessing.dataset_validation import (
     DatasetValidationConfig,
@@ -96,6 +100,7 @@ IMPLEMENTED_STAGES: frozenset[PipelineStage] = frozenset(
         PipelineStage.CYCLE_QUALITY_PROFILING,
         PipelineStage.VALIDATION_RULE_GENERATION,
         PipelineStage.DATASET_VALIDATION,
+        PipelineStage.FEATURE_ENGINEERING,
     }
 )
 STAGE_DIRECTORIES: dict[PipelineStage, str] = {
@@ -142,6 +147,7 @@ class PipelineConfig:
     signal_roles: dict[str, object] | None = None
     validation_rule_generation: dict[str, object] | None = None
     dataset_validation: dict[str, object] | None = None
+    cycle_tensor_generation: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -301,6 +307,7 @@ def _plot_cycle_validation(
     output_path: Path,
     experiment: str,
     movement_threshold: float,
+    current_df: pd.DataFrame | None = None,
 ) -> Path | None:
     """Save one interactive Plotly validation plot for detected cycles."""
 
@@ -342,6 +349,23 @@ def _plot_cycle_validation(
         fig.add_hline(
             y=movement_threshold,
             line=dict(color="black", dash="dash", width=1.0),
+        )
+
+    if current_df is not None and not current_df.empty:
+        current_indices = _evenly_spaced_indices(len(current_df), MAX_VALIDATION_POINTS)
+        current_plot_df = current_df.iloc[current_indices]
+        fig.add_trace(
+            go.Scattergl(
+                x=current_plot_df["time"],
+                y=current_plot_df["value"],
+                mode="markers",
+                marker=dict(size=3, color="orange"),
+                name="Current samples",
+                customdata=current_plot_df[["time", "value"]],
+                hovertemplate=(
+                    "timestamp: %{customdata[0]}<br>value: %{customdata[1]}<extra></extra>"
+                ),
+            )
         )
 
     if not cycles_plot_df.empty:
@@ -396,6 +420,13 @@ def _plot_cycle_validation(
         dragmode="zoom",
         hovermode="closest",
         xaxis=dict(rangeslider=dict(visible=False)),
+        **(
+            {
+                
+            }
+            if current_df is not None and not current_df.empty
+            else {}
+        ),
     )
     fig.update_layout(
         modebar_add=[
@@ -471,7 +502,17 @@ def _run_signal_discovery_stage(
             f"experiment {experiment!r} and unit {reference_signal!r}, "
             f"found {len(reference_signals)}."
         )
+    current_signals = find_signals(
+        uuid_signal_info,
+        path_contains=experiment,
+        unit_code="current",
+    )
 
+    current_signal_uuid = (
+        str(current_signals.iloc[0]["signal_id_uuid"])
+        if len(current_signals) == 1
+        else None
+    )
     selected_with_marker = selected_signals.copy()
     selected_with_marker["is_reference_signal"] = (
         selected_with_marker["signal_id_uuid"].fillna("").astype(str)
@@ -482,6 +523,7 @@ def _run_signal_discovery_stage(
         "selected_signals": selected_with_marker,
         "reference_signals": reference_signals,
         "reference_signal_uuid": str(reference_signals.iloc[0]["signal_id_uuid"]),
+        "current_signal_uuid": current_signal_uuid,
         "row_counts": {
             "selected_signals": _row_count(selected_with_marker),
             "reference_signals": _row_count(reference_signals),
@@ -550,18 +592,23 @@ def _run_session_detection_stage(
 
 
 def _build_validation_subset(
-    position_df: pd.DataFrame, session_cycles_df: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    position_df: pd.DataFrame,
+    session_cycles_df: pd.DataFrame,
+    current_df: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Restrict one session's data to a small, fast-to-render validation subset.
 
     Only the first ``MAX_VALIDATION_PLOT_CYCLES`` cycles of the session are
-    kept, and the Position window is limited to the selected cycles' time
-    range plus a one-second margin on each side.
+    kept, and the Position/Current windows are limited to the selected
+    cycles' time range plus a one-second margin on each side.
     """
 
+    empty_current_df = (
+        current_df.iloc[0:0] if current_df is not None else pd.DataFrame()
+    )
     validation_cycles_df = session_cycles_df.iloc[:MAX_VALIDATION_PLOT_CYCLES]
     if validation_cycles_df.empty:
-        return position_df.iloc[0:0], validation_cycles_df
+        return position_df.iloc[0:0], validation_cycles_df, empty_current_df
 
     window_start = pd.Timestamp(validation_cycles_df["start_time"].iloc[0]) - pd.Timedelta(
         seconds=1
@@ -571,7 +618,16 @@ def _build_validation_subset(
     )
     in_window = (position_df["time"] >= window_start) & (position_df["time"] <= window_end)
     validation_position_df = position_df.loc[in_window]
-    return validation_position_df, validation_cycles_df
+
+    if current_df is not None and not current_df.empty:
+        current_in_window = (current_df["time"] >= window_start) & (
+            current_df["time"] <= window_end
+        )
+        validation_current_df = current_df.loc[current_in_window]
+    else:
+        validation_current_df = empty_current_df
+
+    return validation_position_df, validation_cycles_df, validation_current_df
 
 
 def _run_cycle_detection_stage(
@@ -581,12 +637,14 @@ def _run_cycle_detection_stage(
     reference_signal_uuid: str,
     sessions_df: pd.DataFrame,
     movement_threshold: float,
+    current_signal_uuid: str | None = None,
 ) -> dict[str, object]:
     """Detect cycles session by session to preserve bounded memory usage."""
 
     cycle_frames: list[pd.DataFrame] = []
     validation_position_df = pd.DataFrame()
     validation_cycles_df = pd.DataFrame()
+    validation_current_df = pd.DataFrame()
     validation_session_total_cycles = 0
     validation_session_total_position_rows = 0
     captured_validation_subset = False
@@ -612,8 +670,22 @@ def _run_cycle_detection_stage(
         cycle_frames.append(session_cycles_df)
 
         if not captured_validation_subset:
-            validation_position_df, validation_cycles_df = _build_validation_subset(
-                position_df, session_cycles_df
+            session_current_df = (
+                _load_position_window(
+                    dataset_path=dataset_path,
+                    signal_id_uuid=current_signal_uuid,
+                    start_time=pd.Timestamp(session_row.start_time),
+                    end_time=pd.Timestamp(session_row.end_time),
+                )
+                if current_signal_uuid
+                else None
+            )
+            (
+                validation_position_df,
+                validation_cycles_df,
+                validation_current_df,
+            ) = _build_validation_subset(
+                position_df, session_cycles_df, session_current_df
             )
             validation_session_total_cycles = len(session_cycles_df)
             validation_session_total_position_rows = len(position_df)
@@ -644,6 +716,7 @@ def _run_cycle_detection_stage(
         stage_directory / "cycle_validation.html",
         experiment=experiment,
         movement_threshold=movement_threshold,
+        current_df=validation_current_df,
     )
     return {
         "cycles": cycles_df,
@@ -981,6 +1054,67 @@ def _run_dataset_validation_stage(
     }
 
 
+def _run_feature_engineering_stage(
+    stage_directory: Path,
+    valid_core_cycles_path: Path,
+    cycle_index_df: pd.DataFrame,
+    measurements_root: Path,
+    cycle_tensor_generation_config: dict[str, object] | None,
+    dataset_name: str,
+    experiment: str,
+) -> dict[str, object]:
+    """Generate the fixed-length, padding-based cycle tensor dataset from valid core cycles.
+
+    Only ``cycle_id`` is read from ``valid_core_cycles.parquet`` -- this
+    stage never re-derives or re-checks validity, it consumes the frozen
+    decision made by ``dataset_validation``. Cycle timing comes from the
+    cycle index and raw samples come from the measurement store produced by
+    ``multi_sensor_extraction``. Original measured values are kept as-is;
+    shorter cycles are edge-padded and longer cycles are truncated, both at
+    the end of the sequence -- no signal is ever resampled or interpolated.
+    """
+
+    config = CycleTensorGenerationConfig.from_mapping(cycle_tensor_generation_config)
+
+    result = generate_cycle_tensor_dataset(
+        valid_core_cycles_path,
+        cycle_index_df,
+        measurements_root,
+        config,
+        stage_directory,
+        dataset_name=dataset_name,
+        experiment=experiment,
+    )
+
+    summary = result.summary
+    return {
+        "cycle_tensor_metadata": result.metadata,
+        "skipped_cycles": result.skipped_cycles,
+        "cycle_length_statistics": result.length_statistics,
+        "row_counts": {
+            "cycles_requested": int(summary.get("cycles_requested", 0)),
+            "cycles_written": int(summary.get("cycles_written", 0)),
+            "cycles_skipped": int(summary.get("cycles_skipped", 0)),
+            "batches_written": int(summary.get("batches_written", 0)),
+            "target_length": int(summary.get("target_length", 0)),
+        },
+        "output_paths": {
+            "cycle_tensor_metadata_parquet": str(
+                stage_directory / "cycle_tensor_metadata.parquet"
+            ),
+            "skipped_cycles_parquet": str(stage_directory / "skipped_cycles.parquet"),
+            "cycle_tensor_generation_summary_json": str(
+                stage_directory / "cycle_tensor_generation_summary.json"
+            ),
+            "cycle_length_statistics_json": str(
+                stage_directory / "cycle_length_statistics.json"
+            ),
+            "cycle_tensor_batch_files": [str(path) for path in result.written_files],
+            "cycle_tensor_mask_files": [str(path) for path in result.mask_files],
+        },
+    }
+
+
 def run_pipeline(config: PipelineConfig) -> dict[str, object]:
     """Execute the preprocessing pipeline up to the selected stage."""
 
@@ -1010,6 +1144,7 @@ def run_pipeline(config: PipelineConfig) -> dict[str, object]:
         signal_roles=config.signal_roles,
         validation_rule_generation=config.validation_rule_generation,
         dataset_validation=config.dataset_validation,
+        cycle_tensor_generation=config.cycle_tensor_generation,
     )
     stop_stage = _normalize_stage(normalized_config.stop_after)
     _ensure_stage_is_implemented(stop_stage)
@@ -1045,6 +1180,7 @@ def run_pipeline(config: PipelineConfig) -> dict[str, object]:
             "signal_roles": normalized_config.signal_roles,
             "validation_rule_generation": normalized_config.validation_rule_generation,
             "dataset_validation": normalized_config.dataset_validation,
+            "cycle_tensor_generation": normalized_config.cycle_tensor_generation,
         },
         "start_time": start_time.isoformat(),
         "end_time": None,
@@ -1115,6 +1251,7 @@ def run_pipeline(config: PipelineConfig) -> dict[str, object]:
                 results["signal_discovery"]["reference_signal_uuid"],
                 results["session_detection"]["sessions"],
                 normalized_config.movement_threshold,
+                current_signal_uuid=results["signal_discovery"]["current_signal_uuid"],
             ),
             PipelineStage.MULTI_SENSOR_EXTRACTION: lambda: _run_multi_sensor_extraction_stage(
                 normalized_config.dataset_path,
@@ -1161,6 +1298,16 @@ def run_pipeline(config: PipelineConfig) -> dict[str, object]:
                 results["validation_rule_generation"]["validation_thresholds"],
                 normalized_config.signal_roles,
                 normalized_config.dataset_validation,
+                dataset_name,
+                normalized_config.experiment,
+            ),
+            PipelineStage.FEATURE_ENGINEERING: lambda: _run_feature_engineering_stage(
+                run_paths.stage_directories[PipelineStage.FEATURE_ENGINEERING],
+                run_paths.stage_directories[PipelineStage.DATASET_VALIDATION]
+                / "valid_core_cycles.parquet",
+                results["cycle_detection"]["cycles"],
+                results["multi_sensor_extraction"]["measurements_root"],
+                normalized_config.cycle_tensor_generation,
                 dataset_name,
                 normalized_config.experiment,
             ),

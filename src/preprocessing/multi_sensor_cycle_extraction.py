@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.utils.measurement_loader import load_int_signal, load_uuid_signal
+from src.utils.session_signal_cache import SessionSignalCache
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +116,16 @@ def extract_cycle_measurements(
     uuid_signal_info: pd.DataFrame,
     int_signal_info: pd.DataFrame,
     experiment: str,
+    signal_cache: SessionSignalCache | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Extract all available experiment signals for one cycle time interval."""
+    """Extract all available experiment signals for one cycle time interval.
+
+    When ``signal_cache`` is provided (one cache per recording session, see
+    :class:`src.utils.session_signal_cache.SessionSignalCache`), signals are
+    sliced from the in-memory session cache instead of re-opening the
+    Parquet dataset for every cycle. When omitted, behavior is unchanged:
+    each signal is loaded directly from Parquet for this cycle only.
+    """
 
     signal_descriptors = list_experiment_signals(
         uuid_signal_info=uuid_signal_info,
@@ -131,22 +140,36 @@ def extract_cycle_measurements(
                 if pd.isna(row.signal_id_uuid):
                     logger.warning("Skipping UUID signal %s because signal_id_uuid is missing", row.signal_name)
                     continue
-                signal_df = load_uuid_signal(
-                    base_dir,
-                    str(row.signal_id_uuid),
-                    start_time=cycle_start,
-                    end_time=cycle_end,
-                )
+                if signal_cache is not None:
+                    signal_df = signal_cache.slice_uuid_signal(
+                        str(row.signal_id_uuid),
+                        start_time=cycle_start,
+                        end_time=cycle_end,
+                    )
+                else:
+                    signal_df = load_uuid_signal(
+                        base_dir,
+                        str(row.signal_id_uuid),
+                        start_time=cycle_start,
+                        end_time=cycle_end,
+                    )
             else:
                 if pd.isna(row.signal_id):
                     logger.warning("Skipping INT signal %s because signal_id is missing", row.signal_name)
                     continue
-                signal_df = load_int_signal(
-                    base_dir,
-                    int(row.signal_id),
-                    start_time=cycle_start,
-                    end_time=cycle_end,
-                )
+                if signal_cache is not None:
+                    signal_df = signal_cache.slice_int_signal(
+                        int(row.signal_id),
+                        start_time=cycle_start,
+                        end_time=cycle_end,
+                    )
+                else:
+                    signal_df = load_int_signal(
+                        base_dir,
+                        int(row.signal_id),
+                        start_time=cycle_start,
+                        end_time=cycle_end,
+                    )
         except FileNotFoundError:
             logger.warning(
                 "Skipping signal %s because its measurement dataset partition is missing",

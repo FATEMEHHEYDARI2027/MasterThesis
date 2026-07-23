@@ -15,8 +15,10 @@ import pandas as pd
 from src.preprocessing.batch_extraction import (
     SIGNAL_SUMMARY_COLUMNS,
     _extract_cycle_batch_with_summary,
+    _resolve_signal_descriptors,
     iter_cycle_batches,
 )
+from src.utils.session_signal_cache import SessionSignalCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,46 @@ def _write_checkpoint(checkpoint_path: Path, checkpoint: dict[str, object]) -> N
     checkpoint["latest_update_time"] = datetime.now().isoformat()
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path.write_text(json.dumps(checkpoint, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _build_session_cache_manager(
+    base_dir: Path,
+    cycles_df: pd.DataFrame,
+    uuid_signal_info: pd.DataFrame,
+    int_signal_info: pd.DataFrame,
+    experiment: str,
+    selected_signals: Sequence[str] | None,
+) -> SessionSignalCacheManager | None:
+    """Build one session-scoped signal cache manager for the whole run.
+
+    Session time bounds are derived from the existing ``start_time``/
+    ``end_time`` of the cycles themselves (already produced by cycle
+    detection), so cycle detection does not need to change and each signal
+    is loaded from Parquet only once per recording session rather than once
+    per cycle.
+    """
+
+    if cycles_df.empty or "session_id" not in cycles_df.columns:
+        return None
+
+    signal_descriptors = _resolve_signal_descriptors(
+        uuid_signal_info, int_signal_info, experiment, selected_signals
+    )
+
+    session_bounds: dict[int, tuple[pd.Timestamp, pd.Timestamp]] = {}
+    session_cycle_counts: dict[int, int] = {}
+    for session_id, session_cycles_df in cycles_df.groupby("session_id"):
+        session_start = pd.Timestamp(session_cycles_df["start_time"].min())
+        session_end = pd.Timestamp(session_cycles_df["end_time"].max()) + pd.Timedelta(microseconds=1)
+        session_bounds[int(session_id)] = (session_start, session_end)
+        session_cycle_counts[int(session_id)] = int(len(session_cycles_df))
+
+    return SessionSignalCacheManager(
+        base_dir=base_dir,
+        signal_descriptors=signal_descriptors,
+        session_bounds=session_bounds,
+        session_cycle_counts=session_cycle_counts,
+    )
 
 
 def write_measurement_batches(
@@ -159,10 +201,27 @@ def write_measurement_batches(
         }
         _write_checkpoint(checkpoint_path, checkpoint)
 
-    for batch_index, cycle_batch in enumerate(iter_cycle_batches(cycles_df, cycle_batch_size), start=1):
-        if batch_index in completed_batch_indices:
-            continue
+    cycle_batches = list(enumerate(iter_cycle_batches(cycles_df, cycle_batch_size), start=1))
+    pending_cycle_batches = [
+        (batch_index, cycle_batch)
+        for batch_index, cycle_batch in cycle_batches
+        if batch_index not in completed_batch_indices
+    ]
+    pending_cycles_df = (
+        pd.concat([cycle_batch for _, cycle_batch in pending_cycle_batches], ignore_index=True)
+        if pending_cycle_batches
+        else cycles_df.iloc[0:0]
+    )
+    session_cache_manager = _build_session_cache_manager(
+        base_dir=base_dir,
+        cycles_df=pending_cycles_df,
+        uuid_signal_info=uuid_signal_info,
+        int_signal_info=int_signal_info,
+        experiment=experiment,
+        selected_signals=selected_signals,
+    )
 
+    for batch_index, cycle_batch in pending_cycle_batches:
         batch_started = datetime.now()
         measurements_df, summary_df = _extract_cycle_batch_with_summary(
             base_dir=base_dir,
@@ -171,6 +230,7 @@ def write_measurement_batches(
             int_signal_info=int_signal_info,
             experiment=experiment,
             selected_signals=selected_signals,
+            session_cache_manager=session_cache_manager,
         )
 
         batch_cycle_ids = cycle_batch["cycle_id"].astype(int).tolist()

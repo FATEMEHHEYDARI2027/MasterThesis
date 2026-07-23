@@ -1,17 +1,17 @@
 dataset_path: /data/ERA/D63_Nr7_8
 experiment: Versuch1
-stop_after: dataset_validation
+stop_after: MULTI_SENSOR_EXTRACTION
 reference_signal: position
-session_gap_seconds: 3600.0
+session_gap_seconds: 1.0
 movement_threshold: 1.0
-output_root: outputs
+output_root: outputs_cached_full_run
 
 # Final full-dataset run
-extract_all_cycles: true
+extract_all_cycles: false
 max_cycles_to_extract: 100
 cycle_batch_size: 500
-resume_extraction: true
-overwrite_existing: false
+resume_extraction: false
+overwrite_existing: true
 
 # HTML is useful for development, but not necessary for all cycles
 generate_validation_html: false
@@ -84,5 +84,22 @@ validation_rule_generation:
 dataset_validation:
   enabled: true
   fail_on_missing_generated_rule: false
-  allow_provisional_rules: false
+  allow_provisional_rules: true
   write_signal_level_results: true
+
+cycle_tensor_generation:
+  enabled: true
+  required_signals:
+    - position
+    - velocity
+    - current
+    - pressure
+    - temperature
+  reference_signal: position
+  target_length_strategy: percentile
+  target_length_percentile: 99
+  padding_method: edge
+  truncate_long_cycles: true
+  save_padding_mask: true
+  output_format: npy
+  cycles_per_file: 64

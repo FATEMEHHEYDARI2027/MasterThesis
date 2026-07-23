@@ -12,6 +12,7 @@ from src.preprocessing.multi_sensor_cycle_extraction import (
     extract_cycle_measurements,
     list_experiment_signals,
 )
+from src.utils.session_signal_cache import SessionSignalCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ def _extract_cycle_batch_with_summary(
     int_signal_info: pd.DataFrame,
     experiment: str,
     selected_signals: Sequence[str] | None = None,
+    session_cache_manager: SessionSignalCacheManager | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Extract one cycle batch, returning both measurements and a summary.
 
@@ -100,6 +102,11 @@ def _extract_cycle_batch_with_summary(
     (measurements only) and :func:`src.storage.batched_measurement_writer`
     (which also needs the missing-signal summary) so the underlying signal
     catalogue and raw extraction only happen once per batch.
+
+    ``session_cache_manager``, when provided, supplies one in-memory
+    :class:`~src.utils.session_signal_cache.SessionSignalCache` per
+    recording session so each signal is loaded from Parquet only once per
+    session instead of once per cycle.
     """
 
     signal_descriptors = _resolve_signal_descriptors(
@@ -116,6 +123,12 @@ def _extract_cycle_batch_with_summary(
         cycle_id = int(cycle_row.cycle_id)
         session_id = int(cycle_row.session_id) if hasattr(cycle_row, "session_id") else None
 
+        signal_cache = (
+            session_cache_manager.get(session_id)
+            if session_cache_manager is not None and session_id is not None
+            else None
+        )
+
         cycle_extraction_error = False
         try:
             extracted_signals = extract_cycle_measurements(
@@ -125,6 +138,7 @@ def _extract_cycle_batch_with_summary(
                 uuid_signal_info=uuid_signal_info,
                 int_signal_info=int_signal_info,
                 experiment=experiment,
+                signal_cache=signal_cache,
             )
         except FileNotFoundError:
             logger.warning(
@@ -216,6 +230,9 @@ def _extract_cycle_batch_with_summary(
                     ),
                 }
             )
+
+        if session_cache_manager is not None and session_id is not None:
+            session_cache_manager.mark_cycle_done(session_id)
 
     measurements_df = (
         pd.concat(measurement_frames, ignore_index=True)
